@@ -55,7 +55,7 @@ def login_prompt(secrets_manager_cls: Type[BaseSecretsManager], style: Style):
                     store_password_verification(secrets_manager)
     else:
         password = input_dialog(
-            title="Welcome back to Hummingbot",
+            title="Welcome back to AlgoRex",
             text="Enter your password:",
             password=True,
             style=style).run()
@@ -176,17 +176,18 @@ def show_welcome(style: Style):
         title='Welcome to Hummingbot',
         text="""
 
-    ██╗  ██╗██╗   ██╗███╗   ███╗███╗   ███╗██╗███╗   ██╗ ██████╗ ██████╗  ██████╗ ████████╗
-    ██║  ██║██║   ██║████╗ ████║████╗ ████║██║████╗  ██║██╔════╝ ██╔══██╗██╔═══██╗╚══██╔══╝
-    ███████║██║   ██║██╔████╔██║██╔████╔██║██║██╔██╗ ██║██║  ███╗██████╔╝██║   ██║   ██║
-    ██╔══██║██║   ██║██║╚██╔╝██║██║╚██╔╝██║██║██║╚██╗██║██║   ██║██╔══██╗██║   ██║   ██║
-    ██║  ██║╚██████╔╝██║ ╚═╝ ██║██║ ╚═╝ ██║██║██║ ╚████║╚██████╔╝██████╔╝╚██████╔╝   ██║
-    ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═════╝  ╚═════╝    ╚═╝
+                █████╗ ██╗      ██████╗  ██████╗ ██████╗ ███████╗██╗  ██╗
+                ██╔══██╗██║     ██╔════╝ ██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝
+                ███████║██║     ██║  ███╗██║   ██║██████╔╝█████╗   ╚███╔╝ 
+                ██╔══██║██║     ██║   ██║██║   ██║██╔══██╗██╔══╝   ██╔██╗ 
+                ██║  ██║███████╗╚██████╔╝╚██████╔╝██║  ██║███████╗██╔╝ ██╗
+                ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝
+                        >>> Algorithmic Trading Excellence <<<
 
     =======================================================================================
 
     Version: {version}
-    Codebase: https://github.com/hummingbot/hummingbot
+    Codebase: https://github.com/nvequant/algorex
 
 
         """.format(version=version),
@@ -196,15 +197,10 @@ def show_welcome(style: Style):
         text="""
 
 
-    PLEASE READ THIS CAREFULLY BEFORE USING HUMMINGBOT:
+    PLEASE READ THIS CAREFULLY BEFORE USING ALGOREX:
 
-    Hummingbot is a free and open source software client that helps you build algorithmic
-    crypto trading strategies.
+    Algorex is a proprietary software client under development by Innovo Partners Limited which helps build and run market making, arbitrage, and other high-frequency trading bots on digital markets.
 
-    Algorithmic crypto trading is a risky activity. You will be building a "bot" that
-    automatically places orders and trades based on parameters that you set. Please take
-    the time to understand how each strategy works before you risk real capital with it.
-    You are solely responsible for the trades that you perform using Hummingbot.
 
         """,
         style=style).run()

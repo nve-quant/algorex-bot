@@ -3,8 +3,9 @@ import time
 import random
 import asyncio
 import sys
+import math
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 import pandas as pd
 import requests
@@ -303,31 +304,50 @@ class SimpleVol(ScriptStrategyBase):
         """
         Check the PnL and fees using performance metrics and stop the bot if max loss is exceeded. Also checks for volume.
         """
-        performance = await self.retrieve_performance_metrics()
+        try:
+            performance = await self.retrieve_performance_metrics()
 
-        if self.config.max_loss > Decimal(0) and performance is not None:
-            total_pnl = performance.total_pnl
-            best_ask_price = self.connectors[self.config.maker_exchange].get_price(
-                self.config.maker_pair, True
-            )
-            value = self.initial_base * best_ask_price + self.initial_quote
-            pnl_percentage = (-total_pnl) / value * 100
+            if performance is None:
+                self.logger().warning("Unable to retrieve performance metrics")
+                return False
 
-            if -pnl_percentage <= -self.config.max_loss:
-                self.logger().info(
-                    f"Max loss of {self.config.max_loss}% exceeded with Pct: {pnl_percentage}%. Stopping strategy."
+            if self.config.max_loss > Decimal(0):
+                # Use trade_pnl instead of total_pnl to exclude fees from shutdown logic
+                trade_pnl = performance.trade_pnl
+                best_ask_price = self.connectors[self.config.maker_exchange].get_price(
+                    self.config.maker_pair, True
                 )
-                safe_ensure_future(self.stop_hummingbot())
-                return True
+                if best_ask_price is None:
+                    self.logger().warning("Unable to fetch price for PnL calculation")
+                    return False
 
-        if self.config.volume > Decimal(0) and performance is not None:
-            total_volume = performance.s_vol_quote
-            if total_volume > self.config.volume:
-                self.logger().info(
-                    f"Reached {self.config.volume} $ Volume. Stopping strategy."
-                )
-                safe_ensure_future(self.stop_hummingbot())
-                return True
+                value = self.initial_base * best_ask_price + self.initial_quote
+                pnl_percentage = (-trade_pnl) / value * 100
+
+                self.logger().info(f"Current PnL: {pnl_percentage:.2f}% (Max allowed loss: {self.config.max_loss}%)")
+
+                if -pnl_percentage <= -self.config.max_loss:
+                    self.logger().warning(
+                        f"Max loss of {self.config.max_loss}% exceeded with Pct: {pnl_percentage}% (excluding fees). Stopping strategy."
+                    )
+                    safe_ensure_future(self.stop_hummingbot())
+                    return True
+
+            if self.config.volume > Decimal(0):
+                total_volume = performance.s_vol_quote
+                self.logger().info(f"Current volume: ${total_volume} (Target: ${self.config.volume})")
+                
+                if total_volume > self.config.volume:
+                    self.logger().warning(
+                        f"Target volume of ${self.config.volume} reached. Current volume: ${total_volume}. Stopping strategy."
+                    )
+                    safe_ensure_future(self.stop_hummingbot())
+                    return True
+
+            return False
+        except Exception as e:
+            self.logger().error(f"Error in check_performance_and_stop: {str(e)}")
+            return False
 
     def check_time_limit(self) -> bool:
         """
@@ -344,10 +364,20 @@ class SimpleVol(ScriptStrategyBase):
         """
         Main logic of the bot that is executed every tick.
         """
-        if not self.strategy_active or self.shutting_down or not self.do_tick:
+        if not self.strategy_active:
+            self.logger().warning("Strategy not active - stopping tick execution")
+            return
+
+        if self.shutting_down:
+            self.logger().warning("Strategy is shutting down - stopping tick execution")
+            return
+
+        if not self.do_tick:
+            self.logger().warning("do_tick is False - stopping tick execution")
             return
 
         if self.last_cancel or self.first_cancle:
+            self.logger().warning("Last cancel or first cancel flag set - initiating shutdown")
             safe_ensure_future(self.stop_hummingbot())
             return
 
@@ -355,40 +385,45 @@ class SimpleVol(ScriptStrategyBase):
 
         # Check if the time limit has been exceeded
         if self.config.time_limit > 0 and self.check_time_limit():
+            self.logger().warning(f"Time limit of {self.config.time_limit} minutes exceeded - initiating shutdown")
             return
 
         # Ensure minimum time between orders
         if current_time - self.last_order_time < self.config.order_interval:
-            self.logger().debug(f"Skipping tick, waiting for order interval ({self.config.order_interval}s)")
+            self.logger().debug(f"Waiting for order interval ({self.config.order_interval}s) - {current_time - self.last_order_time}s elapsed")
             return
 
         # Only clean orders periodically
         if current_time - self.last_clean_time > self.config.order_interval * 10:
+            self.logger().info("Periodic order cleanup triggered")
             self.last_clean_time = current_time
             safe_ensure_future(self.cancel_all_orders())
             return
 
         # Add balance check before trading
         if not safe_ensure_future(self.check_and_update_balances()):
-            self.logger().warning("Unable to verify balances, skipping tick")
+            self.logger().warning("Balance check failed - skipping tick")
             return
-
-        # Schedule the performance check
-        safe_ensure_future(self.check_performance_and_stop())
 
         # Get current prices
         best_bid_price = self.connectors[self.config.maker_exchange].get_price(self.config.maker_pair, False)
         best_ask_price = self.connectors[self.config.maker_exchange].get_price(self.config.maker_pair, True)
 
         if best_bid_price is None or best_ask_price is None:
-            self.logger().warning("Unable to fetch prices. Skipping tick.")
+            self.logger().warning("Unable to fetch prices - skipping tick")
             return
 
         # Calculate amount within bounds
         amount = self.calculate_order_amount()
+        if amount == Decimal("0"):
+            self.logger().warning("Calculated order amount is zero - skipping tick")
+            return
 
         # Calculate execution price within spread
         execution_price = self.calculate_price_within_spread(best_bid_price, best_ask_price)
+        if execution_price is None:
+            self.logger().warning("Could not calculate valid execution price - skipping tick")
+            return
 
         # Place orders with validated amount
         safe_ensure_future(self.place_orders_and_update(
@@ -398,30 +433,33 @@ class SimpleVol(ScriptStrategyBase):
             execution_price
         ))
 
-    async def place_orders_and_update(self, sell_exchange: str, buy_exchange: str, 
+    async def place_orders_and_update(self, sell_exchange: str, buy_exchange: str,
                                     amount: Decimal, price: Decimal):
         """
         Places orders and handles the updates if successful
         """
-        async with self.order_placement_lock:  # Use lock to prevent concurrent order placement
-            current_time = time.time()
-            if current_time - self.last_order_time < self.config.order_interval:
-                self.logger().debug("Order placement attempted too soon, skipping")
-                return
+        try:
+            async with self.order_placement_lock:  # Use lock to prevent concurrent order placement
+                current_time = time.time()
+                if current_time - self.last_order_time < self.config.order_interval:
+                    self.logger().debug("Order placement attempted too soon, skipping")
+                    return
 
-            success = await self.place_matching_orders(
-                sell_exchange,
-                buy_exchange,
-                amount,
-                price
-            )
+                success = await self.place_matching_orders(
+                    sell_exchange,
+                    buy_exchange,
+                    amount,
+                    price
+                )
 
-            if success:
-                self.last_order_time = current_time  # Update last order time only on success
-                safe_ensure_future(self.track_order_completion(amount))
-                self.switch_exchanges()
-            else:
-                self.logger().warning("Failed to place matching orders, skipping trade")
+                if success:
+                    self.last_order_time = current_time  # Update last order time only on success
+                    safe_ensure_future(self.track_order_completion(amount))
+                    self.switch_exchanges()
+                else:
+                    self.logger().warning("Failed to place matching orders, skipping trade")
+        except Exception as e:
+            self.logger().error(f"Error in place_orders_and_update: {str(e)}")
 
     def calculate_random_order_size(self, mid_price: Decimal) -> Decimal:
         """
@@ -463,60 +501,469 @@ class SimpleVol(ScriptStrategyBase):
         
         return base_amount
 
+    def get_prices_from_both_exchanges(self) -> Tuple[Decimal, Decimal, Decimal, Decimal]:
+        """
+        Get bid and ask prices from both exchanges.
+        Returns (maker_bid, maker_ask, taker_bid, taker_ask)
+        """
+        maker_bid = self.connectors[self.config.maker_exchange].get_price(self.config.maker_pair, False)
+        maker_ask = self.connectors[self.config.maker_exchange].get_price(self.config.maker_pair, True)
+        taker_bid = self.connectors[self.config.taker_exchange].get_price(self.config.taker_pair, False)
+        taker_ask = self.connectors[self.config.taker_exchange].get_price(self.config.taker_pair, True)
+        
+        return maker_bid, maker_ask, taker_bid, taker_ask
+
+    def determine_market_phase(self, bid_price: Decimal, ask_price: Decimal):
+        """
+        Determine market phase based on orderbook dynamics with variable thresholds.
+        """
+        spread = ask_price - bid_price
+        mid_price = (ask_price + bid_price) / Decimal("2")
+        spread_percentage = (spread / mid_price) * Decimal("100")
+        
+        # Add some memory of recent price action
+        if not hasattr(self, 'recent_spreads'):
+            self.recent_spreads = []
+        self.recent_spreads.append(spread_percentage)
+        if len(self.recent_spreads) > 20:  # Keep last 20 spreads
+            self.recent_spreads.pop(0)
+        
+        avg_spread = sum(self.recent_spreads) / len(self.recent_spreads)
+        spread_volatility = Decimal(str(max(0.0001, 
+            sum((s - avg_spread) ** 2 for s in self.recent_spreads) / len(self.recent_spreads))))
+        
+        # Dynamic thresholds based on recent spread behavior
+        volatility_threshold = max(Decimal("0.3"), avg_spread * Decimal("1.5"))
+        consolidation_threshold = min(Decimal("0.15"), avg_spread * Decimal("0.7"))
+        
+        # Determine if we should change phase
+        if self.phase_candle_counter >= self.phase_duration:
+            # Add randomness to phase duration
+            base_duration = random.randint(8, 25)  # More variable base duration
+            noise_factor = Decimal(str(random.uniform(0.8, 1.2)))  # ±20% noise
+            
+            if spread_percentage > volatility_threshold or spread_volatility > Decimal("0.01"):
+                self.market_phase = 'volatility'
+                self.phase_duration = max(3, int(base_duration * Decimal("0.4") * noise_factor))
+            elif spread_percentage < consolidation_threshold and spread_volatility < Decimal("0.005"):
+                self.market_phase = 'consolidation'
+                self.phase_duration = max(5, int(base_duration * Decimal("1.2") * noise_factor))
+            else:
+                # More organic trend changes
+                if self.market_phase in ['consolidation', 'volatility'] or self.market_phase is None:
+                    # Higher chance of trend continuation after volatility
+                    if self.market_phase == 'volatility' and random.random() < 0.7:
+                        self.market_phase = 'trend_down' if spread_percentage > avg_spread else 'trend_up'
+                    else:
+                        self.market_phase = random.choice(['trend_up', 'trend_down'])
+                else:
+                    # Chance of trend continuation
+                    if random.random() < 0.3:  # 30% chance to continue trend
+                        pass  # Keep current trend
+                    else:
+                        self.market_phase = 'trend_down' if self.market_phase == 'trend_up' else 'trend_up'
+                
+                self.phase_duration = max(5, int(base_duration * noise_factor))
+            
+            self.phase_candle_counter = 0
+            self.logger().info(
+                f"Switching to {self.market_phase} phase for {self.phase_duration} ticks "
+                f"(spread: {spread_percentage:.3f}%, avg: {avg_spread:.3f}%, vol: {spread_volatility:.5f})"
+            )
+
     def calculate_price_within_spread(
         self, best_bid_price: Decimal, best_ask_price: Decimal
     ) -> Decimal:
         """
-        Simulate natural market structures within the bid-ask spread.
+        Calculate execution price based on market phase with organic variations and spread stability protection.
+        Also handles dust orders that attempt to manipulate the spread.
         """
+        if best_bid_price is None or best_ask_price is None:
+            self.logger().warning("Unable to fetch prices")
+            return None
+            
         spread = best_ask_price - best_bid_price
-        price_increment = self.connectors[
-            self.config.maker_exchange
-        ].trading_rules[self.config.maker_pair].min_price_increment
+        mid_price = (best_ask_price + best_bid_price) / Decimal("2")
 
-        phase_progress = Decimal(self.phase_candle_counter) / Decimal(self.phase_duration)
-        fluctuation = Decimal(random.uniform(-0.05, 0.05))
+        # Get price increment early for use throughout the method
+        try:
+            price_increment = self.connectors[
+                self.config.maker_exchange
+            ].trading_rules[self.config.maker_pair].min_price_increment
+        except Exception as e:
+            self.logger().error(f"Error getting price increment: {str(e)}")
+            return None
+        
+        # Check for dust orders trying to manipulate the spread
+        base_asset, _ = self.config.maker_pair.split('-')
+        
+        # Get order book snapshots from both exchanges
+        maker_orderbook = self.connectors[self.config.maker_exchange].get_order_book(self.config.maker_pair)
+        taker_orderbook = self.connectors[self.config.taker_exchange].get_order_book(self.config.taker_pair)
+        
+        if maker_orderbook is None or taker_orderbook is None:
+            self.logger().warning("Unable to fetch order books")
+            return None
 
-        if self.market_phase == 'trend_up':
-            random_factor = Decimal(phase_progress) + fluctuation
-            random_factor = max(Decimal(0.1), min(Decimal(0.9), random_factor))
-            self.phase_candle_counter += 1
-            if self.phase_candle_counter >= self.phase_duration:
-                self.market_phase = random.choice(['consolidation', 'trend_down', 'volatility'])
-                self.phase_candle_counter = 0
-                self.phase_duration = random.randint(5, 15)
-        elif self.market_phase == 'trend_down':
-            random_factor = Decimal(1 - phase_progress) + fluctuation
-            random_factor = max(Decimal(0.1), min(Decimal(0.9), random_factor))
-            self.phase_candle_counter += 1
-            if self.phase_candle_counter >= self.phase_duration:
-                self.market_phase = random.choice(['consolidation', 'trend_up', 'volatility'])
-                self.phase_candle_counter = 0
-                self.phase_duration = random.randint(5, 15)
-        elif self.market_phase == 'consolidation':
-            random_factor = Decimal(random.uniform(0.4, 0.6))
-            self.phase_candle_counter += 1
-            if self.phase_candle_counter >= self.phase_duration:
-                self.market_phase = random.choice(['trend_up', 'trend_down', 'volatility'])
-                self.phase_candle_counter = 0
-                self.phase_duration = random.randint(5, 15)
-        elif self.market_phase == 'volatility':
-            random_factor = Decimal(random.uniform(0.1, 0.9))
-            self.phase_candle_counter += 1
-            if self.phase_candle_counter >= 3:
-                self.market_phase = random.choice(['trend_up', 'trend_down', 'consolidation'])
-                self.phase_candle_counter = 0
-                self.phase_duration = random.randint(5, 15)
+        # Define dust thresholds (in base token amount)
+        DUST_THRESHOLD_MIN = Decimal("5000")  # 5k tokens minimum to be considered dust
+        DUST_THRESHOLD_MAX = Decimal("20000")  # 20k tokens maximum to be considered dust
+        
+        # Check for dust orders at best bid/ask
+        def is_dust_order(size: Decimal) -> bool:
+            return DUST_THRESHOLD_MIN <= size <= DUST_THRESHOLD_MAX
+
+        try:
+            # Get sizes at best bid/ask using the correct method
+            # Get the first bid and ask entries from the order book
+            maker_bids = maker_orderbook.bid_entries()[:3]  # Get top 3 levels for validation
+            maker_asks = maker_orderbook.ask_entries()[:3]
+            taker_bids = taker_orderbook.bid_entries()[:3]
+            taker_asks = taker_orderbook.ask_entries()[:3]
+            
+            if not maker_bids or not maker_asks or not taker_bids or not taker_asks:
+                self.logger().warning("Order book is empty or insufficient depth")
+                return None
+                
+            best_bid_size = Decimal(str(maker_bids[0].amount))
+            best_ask_size = Decimal(str(maker_asks[0].amount))
+            
+            # Calculate total volume in top 3 levels for validation
+            total_bid_volume = sum(Decimal(str(bid.amount)) for bid in maker_bids)
+            total_ask_volume = sum(Decimal(str(ask.amount)) for ask in maker_asks)
+            
+            # Get prices from both exchanges for cross-validation
+            maker_best_bid = Decimal(str(maker_bids[0].price))
+            maker_best_ask = Decimal(str(maker_asks[0].price))
+            taker_best_bid = Decimal(str(taker_bids[0].price))
+            taker_best_ask = Decimal(str(taker_asks[0].price))
+            
+            # Track last traded price for position detection
+            if not hasattr(self, 'last_traded_price'):
+                self.last_traded_price = mid_price
+            
+            # Calculate price position relative to spread
+            price_position = (self.last_traded_price - best_bid_price) / (best_ask_price - best_bid_price)
+            
+            # Define thresholds for "close to bid/ask"
+            CLOSE_TO_THRESHOLD = Decimal("0.2")  # Consider price "close" if within 20% of bid/ask
+            
+            # Function to check if price is realistic
+            def is_price_realistic(price: Decimal, side: str) -> bool:
+                if side == "buy":
+                    return (
+                        abs(price - taker_best_ask) / taker_best_ask <= Decimal("0.005") and  # Within 0.5% of taker price
+                        price <= maker_best_ask * Decimal("1.005")  # Not more than 0.5% above maker ask
+                    )
+                else:
+                    return (
+                        abs(price - taker_best_bid) / taker_best_bid <= Decimal("0.005") and  # Within 0.5% of taker price
+                        price >= maker_best_bid * Decimal("0.995")  # Not more than 0.5% below maker bid
+                    )
+
+            # Track last dust order time to prevent too frequent attempts
+            if not hasattr(self, 'last_dust_order_time'):
+                self.last_dust_order_time = 0
+            
+            # Minimum time between dust order attempts (5 seconds)
+            DUST_ORDER_COOLDOWN = 5
+            current_time = time.time()
+            
+            # Check if enough time has passed since last dust order
+            if current_time - self.last_dust_order_time < DUST_ORDER_COOLDOWN:
+                return None
+
+            # Enhanced dust opportunity detection with validation
+            dust_opportunity = None
+            
+            # Only take dust sell orders when price is close to ask
+            if (price_position >= (Decimal("1") - CLOSE_TO_THRESHOLD) and  # Price is close to ask
+                is_dust_order(best_bid_size) and 
+                spread > price_increment * Decimal("2") and
+                total_bid_volume >= best_bid_size and  # Verify volume
+                is_price_realistic(best_bid_price, "sell")):
+                
+                # Dust buy order close to ask - opportunity to sell
+                dust_opportunity = ("sell", best_bid_price)
+                self.logger().info(
+                    f"Detected valid dust buy order near ask:\n"
+                    f"Size: {best_bid_size} {base_asset}\n"
+                    f"Price: {best_bid_price}\n"
+                    f"Total depth: {total_bid_volume}\n"
+                    f"Spread: {spread}\n"
+                    f"Price position: {price_position}"
+                )
+                self.last_dust_order_time = current_time
+                
+            # Only take dust buy orders when price is close to bid
+            elif (price_position <= CLOSE_TO_THRESHOLD and  # Price is close to bid
+                  is_dust_order(best_ask_size) and 
+                  spread > price_increment * Decimal("2") and
+                  total_ask_volume >= best_ask_size and  # Verify volume
+                  is_price_realistic(best_ask_price, "buy")):
+                
+                # Dust sell order close to bid - opportunity to buy
+                dust_opportunity = ("buy", best_ask_price)
+                self.logger().info(
+                    f"Detected valid dust sell order near bid:\n"
+                    f"Size: {best_ask_size} {base_asset}\n"
+                    f"Price: {best_ask_price}\n"
+                    f"Total depth: {total_ask_volume}\n"
+                    f"Spread: {spread}\n"
+                    f"Price position: {price_position}"
+                )
+                self.last_dust_order_time = current_time
+
+            if dust_opportunity:
+                side, price = dust_opportunity
+                # Return the dust order price to take advantage of the opportunity
+                return price
+                
+        except Exception as e:
+            self.logger().error(f"Error checking for dust orders: {str(e)}")
+            # Continue with normal pricing if dust check fails
+            pass
+
+        # If no dust opportunities, continue with normal spread-based pricing
+        # Track recent prices for stability check
+        if not hasattr(self, 'recent_prices'):
+            self.recent_prices = []
+        if not hasattr(self, 'recent_spreads'):
+            self.recent_spreads = []
+        if not hasattr(self, 'last_spread_update'):
+            self.last_spread_update = time.time()
+            
+        current_time = time.time()
+        # Only update spread history every 2 seconds
+        if current_time - self.last_spread_update >= 2:
+            self.recent_prices.append(mid_price)
+            self.recent_spreads.append(spread / mid_price)
+            self.last_spread_update = current_time
+            
+            # Keep last 5 spreads (representing 10 seconds of data)
+            if len(self.recent_prices) > 5:
+                self.recent_prices.pop(0)
+            if len(self.recent_spreads) > 5:
+                self.recent_spreads.pop(0)
+            
+        # Calculate average price and spread
+        avg_price = sum(self.recent_prices) / len(self.recent_prices) if self.recent_prices else mid_price
+        avg_spread_pct = sum(self.recent_spreads) / len(self.recent_spreads) if self.recent_spreads else (spread / mid_price)
+        current_spread_pct = spread / mid_price
+        
+        # Check for abnormal spread conditions - more lenient now
+        max_allowed_spread_multiple = Decimal("4")  # Allow up to 4x average spread
+        max_price_deviation = Decimal("0.008")  # Allow up to 0.8% deviation from average price
+        
+        if current_spread_pct > (avg_spread_pct * max_allowed_spread_multiple):
+            self.logger().warning(f"Abnormally wide spread detected: {current_spread_pct:.4%} vs avg {avg_spread_pct:.4%}")
+            return None
+            
+        # Check for significant price deviations
+        price_deviation = abs(mid_price - avg_price) / avg_price
+        if price_deviation > max_price_deviation:
+            self.logger().warning(f"Significant price deviation detected: {price_deviation:.4%}")
+            return None
+            
+        # Additional protection against sudden bid/ask changes
+        if len(self.recent_prices) > 1:
+            last_price = self.recent_prices[-1]
+            max_tick_move = Decimal("0.005")  # Allow up to 0.5% move per tick
+            if abs(mid_price - last_price) / last_price > max_tick_move:
+                self.logger().warning(f"Price movement too large in single tick: {abs(mid_price - last_price) / last_price:.4%}")
+                return None
+
+        # Update market phase and calculate phase progress
+        self.determine_market_phase(best_bid_price, best_ask_price)
+        raw_progress = Decimal(self.phase_candle_counter) / Decimal(self.phase_duration)
+        phase_progress = Decimal(str(math.sin(float(raw_progress) * math.pi / 2)))  # Non-linear progression
+        
+        # Track price levels and their duration
+        if not hasattr(self, 'current_price_level'):
+            self.current_price_level = Decimal("0.5")
+            self.level_duration = 0
+            self.level_momentum = Decimal("0")
+            self.last_direction = None
+            self.consecutive_same_direction = 0
+        
+        # Determine if we should start a new price level
+        should_change_level = False
+        if self.level_duration > random.randint(3, 8):  # Variable duration at each level
+            should_change_level = random.random() < 0.4  # 40% chance to change level after duration
+        
+        if should_change_level:
+            # Determine new price level with more organic transitions
+            if self.last_direction is None:
+                # Initial direction with slight upward bias (55/45)
+                self.last_direction = 1 if random.random() < 0.55 else -1
+            else:
+                # More natural direction changes based on current level and market phase
+                if self.market_phase == 'consolidation':
+                    # Higher chance of small movements during consolidation
+                    continue_same = random.random() < 0.4
+                    self.consecutive_same_direction = 1 if not continue_same else min(self.consecutive_same_direction + 1, 3)
+                else:
+                    # Adaptive continuation probability based on position in range
+                    range_position = (self.current_price_level - Decimal("0.1")) / Decimal("0.8")  # Normalized position
+                    # Lower continuation probability near edges
+                    edge_factor = min(range_position, Decimal("1") - range_position) * Decimal("2")
+                    continue_prob = float(Decimal("0.6") * edge_factor)
+                    continue_same = random.random() < continue_prob
+                    
+                    if continue_same:
+                        self.consecutive_same_direction += 1
+                    else:
+                        self.consecutive_same_direction = 1
+                        self.last_direction = -self.last_direction
+            
+            # Calculate level change with more variation
+            base_change = random.uniform(0.02, 0.15)  # Reduced from (0.05, 0.25)
+            if random.random() < 0.1:  # Reduced chance from 0.15 to 0.1
+                base_change *= random.uniform(1.2, 1.8)  # Reduced multiplier from (1.5, 2.5)
+            
+            level_change = Decimal(str(base_change)) * Decimal(str(self.last_direction))
+            
+            # Add market phase influence
+            if self.market_phase == 'volatility':
+                # Reduced amplification during volatility
+                level_change *= Decimal(str(random.uniform(1.1, 1.4)))  # Reduced from (1.2, 1.8)
+            elif self.market_phase == 'consolidation':
+                # Increased dampening during consolidation
+                level_change *= Decimal(str(random.uniform(0.2, 0.5)))  # Reduced from (0.3, 0.7)
+            
+            # Natural mean reversion when far from center
+            center_pull = (Decimal("0.5") - self.current_price_level) * Decimal("0.1")  # Reduced from 0.15
+            if abs(center_pull) > Decimal("0.08"):  # Reduced threshold from 0.1
+                level_change += center_pull
+            
+            # Update price level with momentum and noise
+            self.current_price_level += level_change + (self.level_momentum * Decimal("0.15"))  # Reduced from 0.2
+            
+            # Add random noise that persists
+            noise_factor = Decimal(str(random.uniform(-0.03, 0.03)))  # Reduced from (-0.05, 0.05)
+            if random.random() < 0.08:  # Reduced chance from 0.1
+                noise_factor *= Decimal("1.5")  # Reduced multiplier from 2
+            
+            self.current_price_level += noise_factor
+            
+            # Ensure within bounds while allowing edge exploration
+            self.current_price_level = max(Decimal("0.1"), min(Decimal("0.9"), self.current_price_level))
+            
+            # Update momentum with decay
+            self.level_momentum = level_change * Decimal("0.5")  # Carry forward some momentum
+            self.level_duration = 0
         else:
-            random_factor = Decimal(0.5)  # Default to mid-spread if phase is undefined
-
-        price_within_spread = best_bid_price + spread * random_factor
-        if price_within_spread <= best_bid_price:
-            price_within_spread = best_bid_price + price_increment
-        if price_within_spread >= best_ask_price:
-            price_within_spread = best_ask_price - price_increment
-
-        return price_within_spread
+            # Small random walks during the same level
+            micro_change = Decimal(str(random.uniform(-0.01, 0.01)))  # Reduced from (-0.02, 0.02)
+            if random.random() < 0.03:  # Reduced chance from 0.05
+                micro_change *= Decimal("1.5")  # Reduced multiplier from 2
+            
+            self.current_price_level += micro_change
+            self.current_price_level = max(Decimal("0.1"), min(Decimal("0.9"), self.current_price_level))
+            self.level_duration += 1
+            
+            # Gradual momentum decay
+            self.level_momentum *= Decimal("0.95")
+        
+        # Calculate base factor with natural variation
+        variation = Decimal(str(random.uniform(-0.02, 0.02)))  # Reduced from (-0.05, 0.05)
+        if random.random() < 0.1:  # Reduced chance from 0.15
+            variation *= Decimal(str(random.uniform(1.1, 1.3)))  # Reduced multiplier
+        
+        # Use last traded price as anchor to prevent large swings
+        if not hasattr(self, 'last_execution_price'):
+            self.last_execution_price = mid_price
+        
+        # Calculate base factor with stronger anchor to last price
+        last_price_weight = Decimal(str(random.uniform(0.6, 0.8)))  # 60-80% weight to last price
+        spread_position = (self.last_execution_price - best_bid_price) / spread
+        
+        # Ensure spread_position is within bounds
+        spread_position = max(Decimal("0.1"), min(Decimal("0.9"), spread_position))
+        
+        # Add small random walk to spread position
+        random_walk = Decimal(str(random.uniform(-0.03, 0.03)))  # Small random movement
+        spread_position += random_walk
+        
+        # Blend between last position and new random position
+        base_factor = (spread_position * last_price_weight) + (Decimal(str(random.uniform(0.3, 0.7))) * (Decimal("1") - last_price_weight))
+        
+        # Add very small noise for organic movement
+        micro_noise = Decimal(str(random.uniform(-0.01, 0.01)))
+        base_factor += micro_noise
+        
+        # Add market phase influence with reduced impact
+        phase_influence = Decimal("0")
+        if self.market_phase == 'trend_up':
+            base_influence = random.uniform(0.01, 0.03)  # Reduced from (0.02, 0.08)
+            if random.random() < 0.1:  # Reduced chance from 0.15
+                base_influence *= random.uniform(1.1, 1.3)  # Reduced from (1.3, 1.6)
+            phase_influence = Decimal(str(base_influence))
+        elif self.market_phase == 'trend_down':
+            base_influence = random.uniform(0.01, 0.03)  # Reduced from (0.02, 0.08)
+            if random.random() < 0.1:  # Reduced chance from 0.15
+                base_influence *= random.uniform(1.1, 1.3)  # Reduced from (1.3, 1.6)
+            phase_influence = -Decimal(str(base_influence))
+        elif self.market_phase == 'volatility':
+            magnitude = random.uniform(0.02, 0.05)  # Reduced from (0.05, 0.15)
+            if random.random() < 0.05:  # Reduced chance from 0.1
+                magnitude *= random.uniform(1.1, 1.3)  # Reduced from (1.3, 1.6)
+            phase_influence = Decimal(str(magnitude)) * (Decimal("1") if random.random() < 0.5 else Decimal("-1"))
+        elif self.market_phase == 'consolidation':
+            if random.random() < 0.05:  # Reduced chance from 0.08
+                phase_influence = Decimal(str(random.uniform(0.01, 0.03)))  # Reduced from (0.03, 0.1)
+                phase_influence *= (Decimal("1") if random.random() < 0.5 else Decimal("-1"))
+            
+        # Reduced momentum impact
+        if not hasattr(self, 'price_momentum'):
+            self.price_momentum = Decimal("0")
+        
+        # Calculate new momentum with more decay
+        momentum_decay = Decimal(str(random.uniform(0.85, 0.92)))  # Increased decay
+        self.price_momentum = self.price_momentum * momentum_decay
+        
+        # Add very small new momentum
+        new_momentum = Decimal(str(random.uniform(-0.01, 0.01)))  # Reduced from (-0.02, 0.02)
+        if random.random() < 0.05:  # Reduced chance from 0.1
+            new_momentum *= Decimal("1.2")  # Reduced multiplier
+        self.price_momentum += new_momentum
+        
+        # Apply reduced momentum to base factor
+        base_factor += self.price_momentum * Decimal("0.3")  # Reduced impact
+        
+        # Ensure the final price doesn't move too far from last execution
+        max_move = Decimal("0.003")  # Max 0.3% move from last price
+        if abs(base_factor - spread_position) > max_move:
+            # Limit the movement while preserving direction
+            direction = Decimal("1") if base_factor > spread_position else Decimal("-1")
+            base_factor = spread_position + (direction * max_move)
+        
+        # Final bounds check
+        base_factor = max(Decimal("0.1"), min(Decimal("0.9"), base_factor))
+        
+        # Calculate final price within spread
+        try:
+            price_within_spread = best_bid_price + (spread * base_factor)
+            
+            # Ensure price respects minimum increment
+            if price_increment:
+                price_within_spread = (price_within_spread // price_increment) * price_increment
+            
+            # Additional protection against large moves
+            max_price_change = self.last_execution_price * Decimal("0.003")  # Max 0.3% change
+            price_within_spread = max(
+                self.last_execution_price - max_price_change,
+                min(self.last_execution_price + max_price_change, price_within_spread)
+            )
+            
+            # Update last execution price
+            self.last_execution_price = price_within_spread
+            
+            return price_within_spread
+            
+        except Exception as e:
+            self.logger().error(f"Error in final price calculation: {str(e)}")
+            return None
 
     def switch_exchanges(self):
         """
@@ -659,6 +1106,14 @@ class SimpleVol(ScriptStrategyBase):
             f"    Total Volume Traded: ${self.total_volume_traded:.2f}",
             f"    Matched Orders Volume: ${self.matched_orders_volume:.2f}",
             f"    Volume with Other Counterparties: ${self.volume_with_counterparties:.2f}"
+        ])
+
+        # Add market phase info
+        lines.extend([
+            "\n  Market Phase Info:",
+            f"    Current Phase: {self.market_phase}",
+            f"    Phase Duration: {self.phase_duration} ticks",
+            f"    Current Tick: {self.phase_candle_counter}"
         ])
 
         return "\n".join(lines)
@@ -844,15 +1299,17 @@ class SimpleVol(ScriptStrategyBase):
                 
                 # Check if balances are too low
                 if self.balances[exchange]["base"] < self.min_balance_threshold:
-                    self.logger().warning(f"Low {base_asset} balance on {exchange}: {self.balances[exchange]['base']}")
+                    self.logger().error(f"CRITICAL: Low {base_asset} balance on {exchange}: {self.balances[exchange]['base']}")
+                    return False
                 if self.balances[exchange]["quote"] < self.min_balance_threshold:
-                    self.logger().warning(f"Low {quote_asset} balance on {exchange}: {self.balances[exchange]['quote']}")
+                    self.logger().error(f"CRITICAL: Low {quote_asset} balance on {exchange}: {self.balances[exchange]['quote']}")
+                    return False
 
             self.last_balance_check = current_time
             return True
 
         except Exception as e:
-            self.logger().error(f"Error checking balances: {str(e)}")
+            self.logger().error(f"CRITICAL: Error checking balances: {str(e)}")
             return False
 
     def calculate_order_amount(self) -> Decimal:
@@ -966,6 +1423,17 @@ class SimpleVol(ScriptStrategyBase):
                 else:
                     # One side filled without the other, likely with another counterparty
                     self.volume_with_counterparties += fill_value
+                    # Cancel the unfilled matching order
+                    if not order_info.get("sell_filled"):
+                        self.logger().info(f"Cancelling unmatched buy order {pair_order_id} as sell order was filled by another counterparty")
+                        safe_ensure_future(self.cancel(self.current_buy_exchange, self.config.maker_pair, pair_order_id))
+                    elif not order_info.get("buy_filled"):
+                        self.logger().info(f"Cancelling unmatched sell order {pair_order_id} as buy order was filled by another counterparty")
+                        safe_ensure_future(self.cancel(self.current_sell_exchange, self.config.maker_pair, pair_order_id))
+                    # Clean up tracking for both orders
+                    del self.pending_order_pairs[order_id]
+                    if pair_order_id in self.pending_order_pairs:
+                        del self.pending_order_pairs[pair_order_id]
             else:
                 # Paired order not found, must be filled with another counterparty
                 self.volume_with_counterparties += fill_value
@@ -973,7 +1441,7 @@ class SimpleVol(ScriptStrategyBase):
             
             self.total_volume_traded += fill_value
             
-            # Log the fill
+            # Log the fill and current statistics
             self.logger().info(
                 f"Order filled - ID: {order_id}, Amount: {fill_amount}, Price: {fill_price}\n"
                 f"Total Volume: ${self.total_volume_traded}\n"

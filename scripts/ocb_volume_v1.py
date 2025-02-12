@@ -200,9 +200,11 @@ class SimpleVol(ScriptStrategyBase):
                         execution_price = self.calculate_price_within_spread(best_bid_price, best_ask_price)
                         
                         # Double-check the price is actually inside the spread
-                        if execution_price >= best_ask_price or execution_price <= best_bid_price:
-                            self.logger().warning("Calculated price outside spread. Using mid-spread instead.")
-                            execution_price = best_bid_price + ((best_ask_price - best_bid_price) * Decimal("0.5"))
+                        spread = best_ask_price - best_bid_price
+                        if execution_price >= best_ask_price:
+                            execution_price = best_ask_price - (spread * Decimal("0.05"))  # 5% inside spread
+                        elif execution_price <= best_bid_price:
+                            execution_price = best_bid_price + (spread * Decimal("0.05"))  # 5% inside spread
                         
                         self.logger().info(f"Selling {base_balance} {base_asset} on {exchange} at price {execution_price}")
                         
@@ -606,8 +608,8 @@ class SimpleVol(ScriptStrategyBase):
             return None
 
         # Define dust thresholds (in base token amount)
-        DUST_THRESHOLD_MIN = Decimal("5000")  # 5k tokens minimum to be considered dust
-        DUST_THRESHOLD_MAX = Decimal("20000")  # 20k tokens maximum to be considered dust
+        DUST_THRESHOLD_MIN = Decimal("1")  # 5k tokens minimum to be considered dust
+        DUST_THRESHOLD_MAX = Decimal("500")  # 20k tokens maximum to be considered dust
         
         # Check for dust orders at best bid/ask
         def is_dust_order(size: Decimal) -> bool:
@@ -955,6 +957,31 @@ class SimpleVol(ScriptStrategyBase):
                 self.last_execution_price - max_price_change,
                 min(self.last_execution_price + max_price_change, price_within_spread)
             )
+            
+            # Add drift
+            if not hasattr(self, 'price_drift'):
+                self.price_drift = Decimal("0")
+
+            drift_change = Decimal(str(random.uniform(-0.0002, 0.0002)))  # Small random drift
+            self.price_drift += drift_change
+            max_drift = spread * Decimal("0.1")  # 10% of spread
+            self.price_drift = max(min(self.price_drift, max_drift), -max_drift)
+
+            # Apply drift to price_within_spread
+            price_within_spread += (spread * self.price_drift)
+            
+            # Add level resistance
+            if not hasattr(self, 'last_price_level'):
+                self.last_price_level = None
+
+            current_level = (price_within_spread - best_bid_price) / spread
+
+            if self.last_price_level is not None:
+                if abs(current_level - self.last_price_level) < Decimal("0.1"):
+                    direction = Decimal("1") if random.random() > 0.5 else Decimal("-1")
+                    price_within_spread += (spread * Decimal("0.05") * direction)
+
+            self.last_price_level = current_level
             
             # Update last execution price
             self.last_execution_price = price_within_spread

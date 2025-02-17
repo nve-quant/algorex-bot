@@ -1,0 +1,4 @@
+aiohttp>=3.8.0
+solana>=0.30.0
+solders>=0.18.0
+web3>=6.0.0 
